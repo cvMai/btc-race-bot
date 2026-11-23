@@ -1,27 +1,33 @@
 /**
- * BTC trend-ride bot for the bars-replay/v1 harness.
+ * BTC trading bot for a bars replay race.
  *
- * Strategy (kept deliberately simple, few parameters, fully deterministic):
- *   - Enter with all cash on the first batch.
- *   - While holding, track the highest close since entry.
- *   - Sell everything when the close falls 3% below that peak, or, once a
- *     360-bar history exists, when the close falls 0.5% below the 360-bar
- *     exponential moving average.
- *   - While flat and a 360-bar history exists, buy back with all cash when
- *     the close rises above the 360-bar EMA.
- * Round trips are expensive in this replay (fees, slippage and price
- * impact), so the bot trades rarely and otherwise just rides the trend.
+ * Idea: ride the trend and trade as rarely as possible, because every
+ * round trip pays fees and slippage in this replay.
+ *
+ * Rules the bot follows:
+ *   - On the first usable batch it buys with all of its cash.
+ *   - While it holds BTC it remembers the highest close since entry.
+ *   - It sells everything if the close drops 3 percent below that peak.
+ *   - It also sells if, once enough history exists, the close falls
+ *     0.5 percent below the slow exponential moving average.
+ *   - While it holds no BTC and enough history exists, it buys back
+ *     with all cash when the close moves back above that average.
+ *
+ * The slow average uses 360 bars. One bar is one minute, so the bot
+ * reacts to a six hour trend rather than to minute by minute noise.
+ * Everything is deterministic: the same batch stream always leads
+ * to the same orders.
  */
 import { createInterface } from "node:readline";
 
-const SYMBOL = "CBBTC";
-const SLOW_N = 360; // EMA length in bars (minutes)
-const EXIT_EMA_MULT = 0.995; // sell when close < EMA * this
-const PEAK_DROP = 0.03; // sell when close < peak since entry * (1 - this)
-const MAX_SLIPPAGE_BPS = 500; // generous, so fast moves do not reject orders
-const MIN_NOTIONAL = 1_000_000n; // 1 USDC in quote units
+const TRADED_SYMBOL = "CBBTC";
+const SLOW_SPAN = 360;
+const PEAK_EXIT_DROP = 0.03;
+const AVERAGE_EXIT_FACTOR = 0.995;
+const SLIPPAGE_LIMIT_BPS = 500;
+const SMALLEST_BUY = 1_000_000n;
 
-type Order = {
+type OutgoingOrder = {
   side: string;
   client_id: string;
   symbol: string;
@@ -30,99 +36,147 @@ type Order = {
   max_slippage_bps: number;
 };
 
-class Bot {
-  warmup = 0;
-  closes: number[] = [];
-  ema: number | null = null;
-  emaK = 2.0 / (SLOW_N + 1);
-  peak: number | null = null; // highest close since the position opened
-  holding = false;
-  enteredOnce = false;
-  buyCount = 0;
-  sellCount = 0;
+function readCloseForSymbol(batch: any): number | null {
+  let found: number | null = null;
+  for (const bar of batch["bars"]) {
+    if (bar["symbol"] === TRADED_SYMBOL) {
+      found = Number(bar["c"]);
+    }
+  }
+  return found;
+}
+
+function readCash(account: any): bigint {
+  return BigInt(account["cash_quote_units"]);
+}
+
+function readHeldQty(account: any): bigint {
+  let held = 0n;
+  for (const position of account["positions"]) {
+    if (position["symbol"] === TRADED_SYMBOL) {
+      held = BigInt(position["qty"]);
+    }
+  }
+  return held;
+}
+
+class TrendRideBot {
+  private warmupBars = 0;
+  private barsSeen = 0;
+  private average: number | null = null;
+  private readonly smoothing = 2.0 / (SLOW_SPAN + 1);
+  private peakSinceEntry: number | null = null;
+  private holdingNow = false;
+  private boughtBefore = false;
+  private buyNumber = 0;
+  private sellNumber = 0;
 
   constructor(hello: any) {
-    this.warmup = Number(hello["warmup_bars"] ?? 0);
+    this.warmupBars = Number(hello["warmup_bars"] ?? 0);
   }
 
-  onBatch(batch: any): Order[] {
+  private updateAverage(close: number): void {
+    if (this.average === null) {
+      this.average = close;
+      return;
+    }
+    this.average = this.average + this.smoothing * (close - this.average);
+  }
+
+  private trackPeak(close: number, wasHolding: boolean): void {
+    if (!this.holdingNow) {
+      this.peakSinceEntry = null;
+      return;
+    }
+    if (!wasHolding || this.peakSinceEntry === null) {
+      this.peakSinceEntry = close;
+      return;
+    }
+    if (close > this.peakSinceEntry) {
+      this.peakSinceEntry = close;
+    }
+  }
+
+  private isUsableClose(close: number): boolean {
+    return Number.isFinite(close) && close > 0;
+  }
+
+  private shouldEnter(close: number): boolean {
+    if (!this.boughtBefore) return true;
+    if (this.barsSeen <= SLOW_SPAN) return false;
+    if (this.average === null) return false;
+    return close > this.average;
+  }
+
+  private shouldExit(close: number): boolean {
+    if (this.peakSinceEntry !== null) {
+      const peakLimit = this.peakSinceEntry * (1.0 - PEAK_EXIT_DROP);
+      if (close < peakLimit) return true;
+    }
+    if (this.barsSeen > SLOW_SPAN && this.average !== null) {
+      if (close < this.average * AVERAGE_EXIT_FACTOR) return true;
+    }
+    return false;
+  }
+
+  onBatch(batch: any): OutgoingOrder[] {
     const seq: number = batch["seq"];
-    let bar: any = null;
-    for (const b of batch["bars"]) {
-      if (b["symbol"] === SYMBOL) bar = b;
-    }
+    const close = readCloseForSymbol(batch);
     const account = batch["account"];
-    const cash = BigInt(account["cash_quote_units"]);
-    let qty = 0n;
-    for (const p of account["positions"]) {
-      if (p["symbol"] === SYMBOL) qty = BigInt(p["qty"]);
-    }
-    const wasHolding = this.holding;
-    this.holding = qty > 0n;
-    if (bar === null) return [];
-    const close = Number(bar["c"]);
-    this.closes.push(close);
-    if (this.ema === null) {
-      this.ema = close;
-    } else {
-      this.ema += this.emaK * (close - this.ema);
-    }
-    if (this.holding) {
-      if (!wasHolding || this.peak === null) {
-        this.peak = close;
-      } else if (close > this.peak) {
-        this.peak = close;
-      }
-    } else {
-      this.peak = null;
-    }
-    if (seq < this.warmup) return [];
-    const n = this.closes.length;
-    const orders: Order[] = [];
-    if (!this.holding) {
-      const enter = !this.enteredOnce || (n > SLOW_N && close > (this.ema as number));
-      if (enter && cash >= MIN_NOTIONAL) {
-        this.enteredOnce = true;
-        this.buyCount += 1;
+    const cash = readCash(account);
+    const heldQty = readHeldQty(account);
+    const wasHolding = this.holdingNow;
+    this.holdingNow = heldQty > 0n;
+    if (close === null || !this.isUsableClose(close)) return [];
+    this.barsSeen += 1;
+    this.updateAverage(close);
+    this.trackPeak(close, wasHolding);
+    if (seq < this.warmupBars) return [];
+    const orders: OutgoingOrder[] = [];
+    if (!this.holdingNow) {
+      if (this.shouldEnter(close) && cash >= SMALLEST_BUY) {
+        this.boughtBefore = true;
+        this.buyNumber += 1;
         orders.push({
           side: "buy",
-          client_id: `b${this.buyCount}`,
-          symbol: SYMBOL,
+          client_id: `buy-${this.buyNumber}`,
+          symbol: TRADED_SYMBOL,
           notional_quote_units: cash.toString(),
-          max_slippage_bps: MAX_SLIPPAGE_BPS,
+          max_slippage_bps: SLIPPAGE_LIMIT_BPS,
         });
       }
-    } else {
-      const dropExit = this.peak !== null && close < this.peak * (1.0 - PEAK_DROP);
-      const emaExit = n > SLOW_N && close < (this.ema as number) * EXIT_EMA_MULT;
-      if (dropExit || emaExit) {
-        this.sellCount += 1;
-        orders.push({
-          side: "sell",
-          client_id: `s${this.sellCount}`,
-          symbol: SYMBOL,
-          qty: qty.toString(),
-          max_slippage_bps: MAX_SLIPPAGE_BPS,
-        });
-      }
+      return orders;
+    }
+    if (this.shouldExit(close)) {
+      this.sellNumber += 1;
+      orders.push({
+        side: "sell",
+        client_id: `sell-${this.sellNumber}`,
+        symbol: TRADED_SYMBOL,
+        qty: heldQty.toString(),
+        max_slippage_bps: SLIPPAGE_LIMIT_BPS,
+      });
     }
     return orders;
   }
 }
 
-let bot: Bot | null = null;
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-rl.on("line", (line: string) => {
-  const trimmed = line.trim();
-  if (!trimmed) return;
-  const msg = JSON.parse(trimmed);
-  if (msg["type"] === "hello") {
-    bot = new Bot(msg);
-  } else if (msg["type"] === "batch") {
-    const orders = (bot as Bot).onBatch(msg);
-    const reply = { type: "reply", seq: msg["seq"], orders };
+let activeBot: TrendRideBot | null = null;
+const lineReader = createInterface({
+  input: process.stdin,
+  crlfDelay: Infinity,
+});
+lineReader.on("line", (rawLine: string) => {
+  const line = rawLine.trim();
+  if (line.length === 0) return;
+  const message = JSON.parse(line);
+  if (message["type"] === "hello") {
+    activeBot = new TrendRideBot(message);
+  } else if (message["type"] === "batch") {
+    const orders = (activeBot as TrendRideBot).onBatch(message);
+    const reply = { type: "reply", seq: message["seq"], orders };
     process.stdout.write(JSON.stringify(reply) + "\n");
-  } else if (msg["type"] === "done") {
-    rl.close();
+  } else if (message["type"] === "done") {
+    lineReader.close();
   }
 });
