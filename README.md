@@ -24,7 +24,7 @@ harness sends, never the clock, the network or the filesystem.
 
 ## Running
 
-The harness runs it as `python3 -P -s main.py` (Python 3.13, standard
+The harness runs it as `node main.ts` (Python 3.13, standard
 library only). It speaks newline-delimited JSON on stdin/stdout: one
 `hello`, one `batch` per minute answered by exactly one `reply`, then
 `done`.
